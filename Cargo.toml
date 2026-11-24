@@ -1,0 +1,34 @@
+[package]
+name = "usbnet-doctor"
+version = "0.1.0"
+edition = "2021"
+description = "Windows diagnostics for USB port speeds, hubs and USB network adapters"
+license = "MIT"
+
+# Only windows-sys 0.59 and winreg: both link through import libraries, so the
+# crate builds on the GNU toolchain without MinGW binutils or Visual Studio.
+[dependencies]
+winreg = "0.52"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_System_EventLog",
+    "Win32_System_Time",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Networking_WinHttp",
+]
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
