@@ -147,9 +147,50 @@ fn ping_targets(adapters: &[net::Adapter]) -> Vec<(String, Ipv4Addr)> {
     t
 }
 
+/// True when this process is alone in its console, i.e. Windows opened the
+/// console just for it (double-click in Explorer). The window would then
+/// close as soon as we exit, so we keep it open instead.
+fn own_console() -> bool {
+    let mut ids = [0u32; 4];
+    let n = unsafe { windows_sys::Win32::System::Console::GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) };
+    n == 1
+}
+
+fn wait_forever() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     init_color(cli.no_color);
+    let standalone = own_console();
+    if standalone {
+        // Keep the window open on a crash too, so the error can be read.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            eprintln!("\nusbnet-doctor stopped because of an error. Close this window with X.");
+            wait_forever();
+        }));
+    }
+
+    loop {
+        run(&cli);
+        if !standalone {
+            break;
+        }
+        println!();
+        println!("{}", bold("Done. Press Enter to run the checks again, or close this window with X."));
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            wait_forever();
+        }
+    }
+}
+
+fn run(cli: &Cli) {
     let cmd = cli.cmd.unwrap_or(Cmd::All);
     let all = cmd == Cmd::All;
 

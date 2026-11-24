@@ -23,6 +23,10 @@ It checks, in one run:
 
 No admin rights are needed.
 
+Double-clicking the `.exe` opens its own console window. That window stays
+open after the checks finish: press Enter to run them again, or close it
+with X. Run from an existing terminal, the tool exits normally.
+
 ## Usage
 
 ```
