@@ -94,16 +94,10 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
             if a.is_usb() {
                 let eee = a.setting("*EEE").or_else(|| a.setting("EEE"));
                 if eee.map(is_on).unwrap_or(false) {
-                    add(
-                        Sev::Info,
-                        format!("{name}: Energy-Efficient Ethernet is on; turning it off can fix short drops and lag spikes"),
-                    );
+                    add(Sev::Info, crate::sys::eee_hint(&name));
                 }
                 if a.setting("*SelectiveSuspend").map(is_on).unwrap_or(false) {
-                    add(
-                        Sev::Info,
-                        format!("{name}: USB selective suspend is on; if the adapter drops out, turn it off"),
-                    );
+                    add(Sev::Info, crate::sys::suspend_hint(&name));
                 }
             }
         }
@@ -138,7 +132,7 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
                 let after = ev
                     .driver_events
                     .iter()
-                    .filter(|e| e.provider == g.provider && e.text == g.text && e.time.secs_since(*at) > 30)
+                    .filter(|e| e.provider == g.provider && crate::events::fold_key(&e.text) == g.key && e.time.secs_since(*at) > 30)
                     .count();
                 if after == 0 {
                     sev = Sev::Info;
@@ -153,7 +147,7 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
         }
         let d = ev.disconnects();
         if d as u32 > ev.days * 3 {
-            add(Sev::Warn, format!("Windows lost the network {d} times in the last {} days", ev.days));
+            add(Sev::Warn, format!("{} lost the network {d} times in the last {} days", crate::sys::OS_NAME, ev.days));
         }
     }
 
@@ -172,11 +166,11 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
                     ),
                 );
             }
-            if p.jitter() > 5.0 || p.max() > 50 {
+            if p.jitter() > 5.0 || p.max() > 50.0 {
                 add(
                     Sev::Warn,
                     format!(
-                        "Unstable latency to your router ({}): jitter {:.1} ms, max {} ms (should be ~1 ms on a cable)",
+                        "Unstable latency to your router ({}): jitter {:.1} ms, max {:.0} ms (should be ~1 ms on a cable)",
                         p.target,
                         p.jitter(),
                         p.max()

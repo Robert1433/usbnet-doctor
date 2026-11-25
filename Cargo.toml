@@ -1,16 +1,21 @@
 [package]
 name = "usbnet-doctor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Windows diagnostics for USB port speeds, hubs and USB network adapters"
+description = "Diagnostics for USB port speeds, hubs and USB network adapters on Windows and Linux"
 license = "MIT"
+repository = "https://github.com/Robert1433/usbnet-doctor"
+readme = "README.md"
+keywords = ["usb", "network", "diagnostics", "ethernet", "adapter"]
+categories = ["command-line-utilities"]
 
-# Only windows-sys 0.59 and winreg: both link through import libraries, so the
-# crate builds on the GNU toolchain without MinGW binutils or Visual Studio.
-[dependencies]
+# Windows: only windows-sys 0.59 and winreg. Both link through import
+# libraries, so the crate builds on the GNU toolchain without MinGW binutils
+# or Visual Studio.
+[target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
-[dependencies.windows-sys]
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [
     "Win32_Foundation",
@@ -27,6 +32,10 @@ features = [
     "Win32_Networking_WinSock",
     "Win32_Networking_WinHttp",
 ]
+
+# Linux: only libc (sockets, ioctls, getifaddrs, localtime).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = true
