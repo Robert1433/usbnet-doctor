@@ -1,36 +1,22 @@
 //! USB topology: every hub, every port, what is plugged in and at what speed.
 //!
-//! Uses the same hub IOCTLs as Microsoft's USBView. A USB 3 hub shows up in
-//! Windows as two hubs (a SuperSpeed one and its USB 2.0 companion); this
-//! module merges each SuperSpeed port with its USB 2.0 companion port so the
-//! tree shows physical ports.
+//! The platform backend (`sys::usb`) lists the hubs and their ports. A USB 3
+//! hub shows up as two hubs (a SuperSpeed one and its USB 2.0 companion), on
+//! Windows and on Linux alike; this module merges each SuperSpeed port with
+//! its USB 2.0 companion port so the tree shows physical connectors.
 
 use std::collections::{HashMap, HashSet};
-use std::ptr::{null, null_mut};
 
-use windows_sys::core::GUID;
-use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW,
-    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CR_SUCCESS,
-};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
-use windows_sys::Win32::System::IO::DeviceIoControl;
-use winreg::enums::HKEY_LOCAL_MACHINE;
-use winreg::RegKey;
-
+use crate::sys;
 use crate::util::*;
 
-const GUID_DEVINTERFACE_USB_HUB: u128 = 0xf18a0e88_c30c_11d0_8815_00a0c906bed8;
-
-const IOCTL_NODE_INFO: u32 = 0x22_0408;
-const IOCTL_DESCRIPTOR: u32 = 0x22_0410;
-const IOCTL_DRIVERKEY: u32 = 0x22_0420;
-const IOCTL_CONN_EX: u32 = 0x22_0448;
-const IOCTL_PORT_PROPS: u32 = 0x22_0458;
-const IOCTL_CONN_EX_V2: u32 = 0x22_045C;
+/// Connection speed of a device, as the backend reports it.
+pub const SPEED_LOW: u8 = 0;
+pub const SPEED_FULL: u8 = 1;
+pub const SPEED_HIGH: u8 = 2;
+pub const SPEED_SUPER: u8 = 3;
+pub const SPEED_SUPER_PLUS: u8 = 4;
+pub const SPEED_SUPER_PLUS_2X2: u8 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -38,24 +24,55 @@ pub struct Connection {
     pub vid: u16,
     pub pid: u16,
     pub is_hub: bool,
+    /// Device id the backend uses to find this device again (upper-cased).
     pub instance: Option<String>,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connector {
+    /// A port the user can plug into (USB-A, or unknown shape on an external hub).
+    External,
+    TypeC,
+    /// Wired to a built-in device (camera, Bluetooth, card reader…).
+    Internal,
+    /// The firmware does not say.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
 pub struct Port {
     pub number: u32,
-    pub user: bool,
-    pub type_c: bool,
+    pub connector: Connector,
     /// Companion port: (hub instance id, upper-cased; port number).
     pub companion: Option<(String, u32)>,
     pub usb2: bool,
     pub usb3: bool,
+    /// Operating at SuperSpeed / SuperSpeed+ right now.
     pub op_ss: bool,
     pub op_ssp: bool,
+    /// The device on this (USB 2.0) port could run at SuperSpeed.
     pub cap_ss: bool,
-    pub status: u32,
+    /// A port error, in words ("not enough power for device").
+    pub problem: Option<String>,
     pub conn: Option<Connection>,
+}
+
+impl Port {
+    pub fn new(number: u32) -> Port {
+        Port {
+            number,
+            connector: Connector::Unknown,
+            companion: None,
+            usb2: false,
+            usb3: false,
+            op_ss: false,
+            op_ssp: false,
+            cap_ss: false,
+            problem: None,
+            conn: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -64,6 +81,7 @@ pub struct Hub {
     pub name: String,
     pub is_root: bool,
     pub bus_powered: bool,
+    /// Host controller name, for root hubs.
     pub controller: Option<String>,
     pub ports: Vec<Port>,
 }
@@ -90,237 +108,8 @@ pub struct UsbTree {
     pub issues: Vec<UsbIssue>,
 }
 
-struct HubHandle(HANDLE);
-impl Drop for HubHandle {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
-fn ioctl(h: HANDLE, code: u32, buf: &mut [u8]) -> Option<usize> {
-    let mut ret = 0u32;
-    let ptr = buf.as_mut_ptr();
-    let ok = unsafe {
-        DeviceIoControl(
-            h,
-            code,
-            ptr as *const _,
-            buf.len() as u32,
-            ptr as *mut _,
-            buf.len() as u32,
-            &mut ret,
-            null_mut(),
-        )
-    };
-    (ok != 0).then_some(ret as usize)
-}
-
-fn u16_at(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
-}
-fn u32_at(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-}
-
-fn interface_paths(guid: &GUID) -> Vec<String> {
-    let mut len = 0u32;
-    unsafe {
-        if CM_Get_Device_Interface_List_SizeW(&mut len, guid, null(), CM_GET_DEVICE_INTERFACE_LIST_PRESENT)
-            != CR_SUCCESS
-            || len == 0
-        {
-            return vec![];
-        }
-        let mut buf = vec![0u16; len as usize];
-        if CM_Get_Device_Interface_ListW(guid, null(), buf.as_mut_ptr(), len, CM_GET_DEVICE_INTERFACE_LIST_PRESENT)
-            != CR_SUCCESS
-        {
-            return vec![];
-        }
-        buf.split(|&c| c == 0)
-            .filter(|s| !s.is_empty())
-            .map(String::from_utf16_lossy)
-            .collect()
-    }
-}
-
-/// "\\?\USB#VID_2109&PID_0817#6&13c452c7&0&6#{guid}" -> "USB\VID_2109&PID_0817\6&13C452C7&0&6"
-pub fn instance_from_link(link: &str) -> String {
-    let s = link.trim_start_matches(r"\\?\").trim_start_matches(r"\\.\");
-    let parts: Vec<&str> = s.split('#').collect();
-    if parts.len() >= 3 {
-        format!(r"{}\{}\{}", parts[0], parts[1], parts[2]).to_uppercase()
-    } else {
-        s.to_uppercase()
-    }
-}
-
-/// Driver key ("{36fc9e60-...}\0012") -> device instance id, for every USB device.
-pub fn driver_map() -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let Ok(usb) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SYSTEM\CurrentControlSet\Enum\USB") else {
-        return map;
-    };
-    for hw in usb.enum_keys().flatten() {
-        let Ok(hk) = usb.open_subkey(&hw) else { continue };
-        for inst in hk.enum_keys().flatten() {
-            let Ok(ik) = hk.open_subkey(&inst) else { continue };
-            if let Ok(drv) = ik.get_value::<String, _>("Driver") {
-                map.insert(drv.to_lowercase(), format!(r"USB\{hw}\{inst}"));
-            }
-        }
-    }
-    map
-}
-
-fn string_descriptor(h: HANDLE, port: u32, index: u8) -> Option<String> {
-    if index == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; 12 + 255];
-    buf[0..4].copy_from_slice(&port.to_le_bytes());
-    buf[4] = 0x80; // device-to-host, standard, device
-    buf[5] = 6; // GET_DESCRIPTOR
-    buf[6..8].copy_from_slice(&((3u16 << 8) | index as u16).to_le_bytes());
-    buf[8..10].copy_from_slice(&0x0409u16.to_le_bytes());
-    buf[10..12].copy_from_slice(&255u16.to_le_bytes());
-    let ret = ioctl(h, IOCTL_DESCRIPTOR, &mut buf)?;
-    if ret < 14 || buf[13] != 3 {
-        return None;
-    }
-    let end = (12 + buf[12] as usize).min(ret);
-    let units: Vec<u16> = buf[14..end].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-    let s = String::from_utf16_lossy(&units).trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-fn read_hub(path: &str, drivers: &HashMap<String, String>) -> Option<Hub> {
-    let w = wide(path);
-    let h = unsafe {
-        CreateFileW(
-            w.as_ptr(),
-            0x4000_0000, // GENERIC_WRITE, as USBView does
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            null(),
-            OPEN_EXISTING,
-            0,
-            null_mut(),
-        )
-    };
-    if h == INVALID_HANDLE_VALUE {
-        return None;
-    }
-    let h = HubHandle(h);
-    let mut ni = vec![0u8; 80];
-    ioctl(h.0, IOCTL_NODE_INFO, &mut ni)?;
-    let count = ni[6] as u32;
-    let bus_powered = ni[75] != 0;
-
-    let instance = instance_from_link(path);
-    let is_root = instance.starts_with(r"USB\ROOT_HUB");
-    let mut ports = Vec::new();
-    for p in 1..=count {
-        let mut port = Port {
-            number: p,
-            user: false,
-            type_c: false,
-            companion: None,
-            usb2: false,
-            usb3: false,
-            op_ss: false,
-            op_ssp: false,
-            cap_ss: false,
-            status: 0,
-            conn: None,
-        };
-
-        let mut pp = vec![0u8; 512];
-        pp[0..4].copy_from_slice(&p.to_le_bytes());
-        if let Some(ret) = ioctl(h.0, IOCTL_PORT_PROPS, &mut pp) {
-            let flags = u32_at(&pp, 8);
-            port.user = flags & 1 != 0;
-            port.type_c = flags & 8 != 0;
-            let cport = u16_at(&pp, 14) as u32;
-            if cport != 0 && ret > 18 {
-                let units: Vec<u16> = pp[16..ret].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-                let link = from_wide(&units);
-                if !link.is_empty() {
-                    port.companion = Some((instance_from_link(&link), cport));
-                }
-            }
-        }
-
-        let mut v2 = vec![0u8; 16];
-        v2[0..4].copy_from_slice(&p.to_le_bytes());
-        v2[4..8].copy_from_slice(&16u32.to_le_bytes());
-        v2[8..12].copy_from_slice(&7u32.to_le_bytes());
-        if ioctl(h.0, IOCTL_CONN_EX_V2, &mut v2).is_some() {
-            let proto = u32_at(&v2, 8);
-            let flags = u32_at(&v2, 12);
-            port.usb2 = proto & 2 != 0;
-            port.usb3 = proto & 4 != 0;
-            port.op_ss = flags & 1 != 0;
-            port.cap_ss = flags & 2 != 0;
-            port.op_ssp = flags & 4 != 0;
-        }
-
-        let mut ce = vec![0u8; 512];
-        ce[0..4].copy_from_slice(&p.to_le_bytes());
-        if ioctl(h.0, IOCTL_CONN_EX, &mut ce).is_some() {
-            port.status = u32_at(&ce, 31);
-            if port.status == 1 {
-                let vid = u16_at(&ce, 12);
-                let pid = u16_at(&ce, 14);
-                let mut dk = vec![0u8; 512];
-                dk[0..4].copy_from_slice(&p.to_le_bytes());
-                let dev_instance = ioctl(h.0, IOCTL_DRIVERKEY, &mut dk).and_then(|ret| {
-                    let units: Vec<u16> = dk[8..ret].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-                    drivers.get(&from_wide(&units).to_lowercase()).cloned()
-                });
-                let reg_name = dev_instance.as_deref().and_then(device_name);
-                let product = string_descriptor(h.0, p, ce[19]);
-                let name = match (product, reg_name) {
-                    (Some(prod), Some(reg)) if !reg.eq_ignore_ascii_case(&prod) && !reg.starts_with("USB Composite") && !reg.starts_with("Generic") => {
-                        format!("{prod} ({reg})")
-                    }
-                    (Some(prod), _) => prod,
-                    (None, Some(reg)) => reg,
-                    (None, None) => "Unknown device".into(),
-                };
-                let name = match vendor(vid) {
-                    Some(v) if name.starts_with("Generic") || name.starts_with("USB Composite") || name == "Unknown device" => {
-                        format!("{name} ({v})")
-                    }
-                    _ => name,
-                };
-                port.conn = Some(Connection {
-                    speed: ce[23],
-                    vid,
-                    pid,
-                    is_hub: ce[24] != 0,
-                    instance: dev_instance.map(|s| s.to_uppercase()),
-                    name,
-                });
-            }
-        }
-        ports.push(port);
-    }
-
-    let controller = if is_root {
-        parent_instance(&instance).and_then(|c| device_name(&c))
-    } else {
-        None
-    };
-    let name = if is_root {
-        "Root hub".to_string()
-    } else {
-        device_name(&instance).unwrap_or_else(|| "USB hub".into())
-    };
-    Some(Hub { instance, name, is_root, bus_powered, controller, ports })
-}
-
-/// Vendors of common hub, dock and adapter chips, for devices Windows calls "Generic".
-fn vendor(vid: u16) -> Option<&'static str> {
+/// Vendors of common hub, dock and adapter chips, for devices without a useful name.
+pub fn vendor(vid: u16) -> Option<&'static str> {
     Some(match vid {
         0x2109 => "VIA Labs",
         0x1A40 => "Terminus Technology",
@@ -341,49 +130,36 @@ fn vendor(vid: u16) -> Option<&'static str> {
         0x27C6 => "Goodix",
         0x046D => "Logitech",
         0x045E => "Microsoft",
+        0x8087 => "Intel",
+        0x1D6B => "Linux Foundation",
         _ => return None,
     })
 }
 
-fn status_text(s: u32) -> &'static str {
-    match s {
-        0 => "empty",
-        1 => "connected",
-        2 => "device failed enumeration",
-        3 => "device general failure",
-        4 => "device caused overcurrent",
-        5 => "not enough power for device",
-        6 => "not enough bandwidth for device",
-        7 => "hubs nested too deeply",
-        8 => "device in legacy hub",
-        9 => "device enumerating",
-        10 => "device reset",
-        _ => "unknown status",
-    }
-}
-
 fn speed_text(c: &Connection, on_ss_port: &Port) -> (String, bool) {
-    if on_ss_port.usb3 && on_ss_port.op_ssp {
+    if c.speed == SPEED_SUPER_PLUS_2X2 {
+        return ("SuperSpeed+ 20 Gbps".into(), true);
+    }
+    if c.speed == SPEED_SUPER_PLUS || (on_ss_port.usb3 && on_ss_port.op_ssp) {
         return ("SuperSpeed+ 10 Gbps".into(), true);
     }
     if on_ss_port.usb3 && on_ss_port.op_ss {
         return ("SuperSpeed 5 Gbps".into(), true);
     }
     match c.speed {
-        0 => ("Low-Speed 1.5 Mbps".into(), false),
-        1 => ("Full-Speed 12 Mbps".into(), false),
-        2 => ("High-Speed 480 Mbps".into(), false),
-        3 => ("SuperSpeed 5 Gbps".into(), true),
+        SPEED_LOW => ("Low-Speed 1.5 Mbps".into(), false),
+        SPEED_FULL => ("Full-Speed 12 Mbps".into(), false),
+        SPEED_HIGH => ("High-Speed 480 Mbps".into(), false),
+        SPEED_SUPER => ("SuperSpeed 5 Gbps".into(), true),
         _ => ("unknown speed".into(), false),
     }
 }
 
 fn short_name(name: &str) -> String {
     let n = name.split(" (").next().unwrap_or(name);
-    if n.len() > 40 {
-        format!("{}…", &n[..40])
-    } else {
-        n.to_string()
+    match n.char_indices().nth(40) {
+        Some((i, _)) => format!("{}…", &n[..i]),
+        None => n.to_string(),
     }
 }
 
@@ -423,11 +199,7 @@ impl<'a> Walker<'a> {
             .iter()
             .filter(|p| !self.is_secondary(p))
             .map(|p| {
-                let sec = if p.usb3 {
-                    p.companion.as_ref().and_then(|(h, n)| self.port(h, *n))
-                } else {
-                    None
-                };
+                let sec = if p.usb3 { p.companion.as_ref().and_then(|(h, n)| self.port(h, *n)) } else { None };
                 (p, sec)
             })
             .collect();
@@ -442,14 +214,11 @@ impl<'a> Walker<'a> {
             if let Some(s) = sec {
                 label.push_str(&format!("/{}", s.number));
             }
-            let kind = if prim.type_c {
-                "USB-C"
-            } else if !prim.user {
-                "internal"
-            } else if hub.is_root {
-                "USB-A"
-            } else {
-                ""
+            let kind = match prim.connector {
+                Connector::TypeC => "USB-C",
+                Connector::Internal => "internal",
+                Connector::External if hub.is_root => "USB-A",
+                _ => "",
             };
             let cap = if prim.usb3 {
                 "USB 3.x"
@@ -466,7 +235,7 @@ impl<'a> Walker<'a> {
             };
 
             let mut desc;
-            let mut child: Option<(&Connection, &Port)> = None;
+            let mut child: Option<&Connection> = None;
             if let Some(c) = ss_conn {
                 let (sp, ss) = speed_text(c, prim);
                 desc = format!("{} {} {}", green("●"), c.name, dim(format!("[{:04X}:{:04X}]", c.vid, c.pid)));
@@ -476,15 +245,15 @@ impl<'a> Walker<'a> {
                     if let Some(h2) = hs_conn.filter(|h| h.is_hub) {
                         desc.push_str(&dim(format!(" + USB 2.0 companion [{:04X}:{:04X}]", h2.vid, h2.pid)));
                     }
-                    child = Some((c, prim));
+                    child = Some(c);
                 }
-                self.record(c, prim, &sp, ss, chain, &label, &hub.name, ext_hubs, bus_pw);
+                self.record(c, &sp, ss, chain, &label, &hub.name, ext_hubs, bus_pw);
             } else if let Some(c) = hs_conn {
                 let port_for_speed = hs_port.unwrap_or(prim);
                 let (sp, _) = speed_text(c, port_for_speed);
                 let ss_capable = prim.usb3 && hs_port.map(|p| p.cap_ss).unwrap_or(false);
                 desc = format!("{} {} {}", green("●"), c.name, dim(format!("[{:04X}:{:04X}]", c.vid, c.pid)));
-                desc.push_str(&format!("  {}", if c.speed == 2 { sp.clone() } else { dim(&sp) }));
+                desc.push_str(&format!("  {}", if c.speed == SPEED_HIGH { sp.clone() } else { dim(&sp) }));
                 if ss_capable {
                     desc.push_str(&yellow("  ⚠ USB 3 device running at USB 2.0 speed"));
                     self.issues.push(UsbIssue {
@@ -497,27 +266,24 @@ impl<'a> Walker<'a> {
                 }
                 if c.is_hub {
                     desc.push_str(&dim(if prim.usb3 { " hub (USB 2.0 link)" } else { " hub (USB 2.0 only)" }));
-                    child = Some((c, port_for_speed));
+                    child = Some(c);
                 }
-                self.record(c, port_for_speed, &sp, false, chain, &label, &hub.name, ext_hubs, bus_pw);
+                self.record(c, &sp, false, chain, &label, &hub.name, ext_hubs, bus_pw);
             } else {
                 desc = dim("empty");
             }
 
             for p in std::iter::once(prim).chain(sec) {
-                if p.status > 1 {
-                    desc.push_str(&red(format!("  ✖ {}", status_text(p.status))));
-                    self.issues.push(UsbIssue {
-                        problem: true,
-                        text: format!("{} {label}: {}", hub.name, status_text(p.status)),
-                    });
+                if let Some(problem) = &p.problem {
+                    desc.push_str(&red(format!("  ✖ {problem}")));
+                    self.issues.push(UsbIssue { problem: true, text: format!("{} {label}: {problem}", hub.name) });
                 }
             }
 
             let label_col = format!("{label:<9} {kind:<8} {cap:<7}");
             self.lines.push(format!("{prefix}{branch}{} {desc}", dim(label_col)));
 
-            if let Some((c, _)) = child {
+            if let Some(c) = child {
                 if let Some(inst) = &c.instance {
                     if let Some(&cidx) = self.by_instance.get(inst.as_str()) {
                         let mut ch = chain.to_vec();
@@ -534,7 +300,6 @@ impl<'a> Walker<'a> {
     fn record(
         &mut self,
         c: &Connection,
-        _port: &Port,
         speed: &str,
         ss: bool,
         chain: &[String],
@@ -561,9 +326,10 @@ impl<'a> Walker<'a> {
 }
 
 pub fn scan() -> UsbTree {
-    let drivers = driver_map();
-    let guid = GUID::from_u128(GUID_DEVINTERFACE_USB_HUB);
-    let mut hubs: Vec<Hub> = interface_paths(&guid).iter().filter_map(|p| read_hub(p, &drivers)).collect();
+    build(sys::usb::hubs())
+}
+
+pub fn build(mut hubs: Vec<Hub>) -> UsbTree {
     hubs.sort_by(|a, b| a.controller.cmp(&b.controller).then(a.instance.cmp(&b.instance)));
 
     let mut w = Walker {
@@ -575,19 +341,39 @@ pub fn scan() -> UsbTree {
         visited: HashSet::new(),
     };
 
-    for (i, hub) in hubs.iter().enumerate().filter(|(_, h)| h.is_root) {
-        let ctrl = hub.controller.clone().unwrap_or_else(|| "USB host controller".into());
-        w.lines.push(bold(&ctrl));
-        w.lines.push(format!("└─ {}", dim(format!("Root hub, {} ports", hub.ports.len()))));
-        w.walk(i, "   ", &[], 0, false);
+    // Root hubs, grouped by controller (Linux shows a USB 2.0 and a USB 3 root
+    // hub for each xHCI controller). Root hubs with nothing left to show after
+    // the merge are skipped.
+    let roots: Vec<usize> = (0..hubs.len())
+        .filter(|&i| hubs[i].is_root && hubs[i].ports.iter().any(|p| !w.is_secondary(p)))
+        .collect();
+    let mut j = 0;
+    while j < roots.len() {
+        let ctrl = &hubs[roots[j]].controller;
+        let group: Vec<usize> = roots[j..].iter().copied().take_while(|&i| &hubs[i].controller == ctrl).collect();
+        j += group.len();
+        w.lines.push(bold(ctrl.clone().unwrap_or_else(|| "USB host controller".into())));
+        for (k, &i) in group.iter().enumerate() {
+            let last = k + 1 == group.len();
+            let ports = hubs[i].ports.iter().filter(|p| !w.is_secondary(p)).count();
+            w.lines.push(format!(
+                "{}{}",
+                if last { "└─ " } else { "├─ " },
+                dim(format!("{}, {ports} ports", hubs[i].name))
+            ));
+            w.walk(i, if last { "   " } else { "│  " }, &[], 0, false);
+        }
     }
 
     // Hubs that were not reached from a root hub (should be rare).
     let orphans: Vec<usize> = (0..hubs.len())
-        .filter(|i| !w.visited.contains(i))
+        .filter(|i| !w.visited.contains(i) && !hubs[*i].is_root)
         .filter(|&i| hubs[i].ports.iter().any(|p| !w.is_secondary(p)))
         .collect();
     for i in orphans {
+        if w.visited.contains(&i) {
+            continue;
+        }
         w.lines.push(bold(format!("{} (not linked to a root hub)", hubs[i].name)));
         w.walk(i, "   ", &[], 1, hubs[i].bus_powered);
     }
@@ -604,19 +390,19 @@ impl UsbTree {
             if let Some(l) = self.locations.get(&cur) {
                 return Some(l);
             }
-            cur = parent_instance(&cur)?.to_uppercase();
+            cur = sys::usb::parent(&cur)?.to_uppercase();
         }
         None
     }
 
     pub fn print(&self) {
         heading("USB topology");
+        if self.lines.is_empty() {
+            println!("{}", dim("No USB controllers found."));
+        }
         for l in &self.lines {
             println!("{l}");
         }
-        println!(
-            "{}",
-            dim("Port n/m = a USB 3 port (n) and its USB 2.0 companion (m) on the same connector.")
-        );
+        println!("{}", dim("Port n/m = a USB 3 port (n) and its USB 2.0 companion (m) on the same connector."));
     }
 }
