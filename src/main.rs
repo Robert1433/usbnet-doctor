@@ -1,5 +1,11 @@
 //! usbnet-doctor: checks USB port speeds and hubs, USB network adapters,
-//! driver errors in the event log, ping quality and internet speed.
+//! driver errors in the system log, ping quality and internet speed.
+//!
+//! Everything that talks to the operating system lives in a backend module
+//! (`win` or `linux`, mounted as `sys`); the rest is shared.
+
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("usbnet-doctor supports Windows and Linux only");
 
 mod diag;
 mod events;
@@ -9,13 +15,20 @@ mod speed;
 mod usb;
 mod util;
 
+#[cfg(target_os = "linux")]
+#[path = "linux/mod.rs"]
+mod sys;
+#[cfg(windows)]
+#[path = "win/mod.rs"]
+mod sys;
+
 use std::net::Ipv4Addr;
 use std::process::exit;
 
 use util::*;
 
 const HELP: &str = "\
-Diagnose USB ports, hubs and USB network adapters on Windows.
+Diagnose USB ports, hubs and USB network adapters (Windows and Linux).
 
 Usage: usbnet-doctor [COMMAND] [OPTIONS]
 
@@ -23,17 +36,17 @@ Commands:
   all      Everything below, then a diagnosis (default)
   usb      USB tree with the speed of every port and device
   net      Network adapters, their USB location and driver settings
-  events   Driver errors and network disconnects from the event log
+  events   Driver errors and network disconnects from the system log
   ping     Packet loss and jitter to the router and the internet
   speed    Download/upload speed and latency under load
 
 Options:
-  --days <N>           Days of event log history to scan [default: 3]
+  --days <N>           Days of system log history to scan [default: 3]
   --pings <N>          Pings per target [default: 30]
   --mb <N>             Megabytes per download run in the speed test [default: 50]
   --rounds <N>         Download runs in the speed test [default: 2]
   --no-speed           Skip the internet speed test in `all`
-  --provider <NAME>    Extra event-log provider (or part of its name) to watch; can repeat
+  --provider <NAME>    Extra log source (driver or provider name) to watch; can repeat
   --events-shown <N>   Events to list per section [default: 12]
   -v, --verbose        Show every advanced driver setting
   --no-color           Plain output without colors
@@ -147,15 +160,6 @@ fn ping_targets(adapters: &[net::Adapter]) -> Vec<(String, Ipv4Addr)> {
     t
 }
 
-/// True when this process is alone in its console, i.e. Windows opened the
-/// console just for it (double-click in Explorer). The window would then
-/// close as soon as we exit, so we keep it open instead.
-fn own_console() -> bool {
-    let mut ids = [0u32; 4];
-    let n = unsafe { windows_sys::Win32::System::Console::GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) };
-    n == 1
-}
-
 fn wait_forever() -> ! {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -165,7 +169,7 @@ fn wait_forever() -> ! {
 fn main() {
     let cli = Cli::parse();
     init_color(cli.no_color);
-    let standalone = own_console();
+    let standalone = sys::own_console();
     if standalone {
         // Keep the window open on a crash too, so the error can be read.
         let default_hook = std::panic::take_hook();
@@ -200,7 +204,7 @@ fn run(cli: &Cli) {
     let need_net = !matches!(cmd, Cmd::Usb);
 
     let usb_tree = need_usb.then(usb::scan);
-    let adapters = if need_net { net::scan(&usb::driver_map()) } else { vec![] };
+    let adapters = if need_net { net::scan() } else { vec![] };
 
     if let Some(t) = &usb_tree {
         if matches!(cmd, Cmd::All | Cmd::Usb) {
@@ -208,9 +212,7 @@ fn run(cli: &Cli) {
         }
     }
     if matches!(cmd, Cmd::All | Cmd::Net) {
-        if let Some(t) = &usb_tree {
-            net::print(&adapters, t, cli.verbose);
-        }
+        net::print(&adapters, usb_tree.as_ref(), cli.verbose);
     }
 
     let event_report = matches!(cmd, Cmd::All | Cmd::Events).then(|| {
